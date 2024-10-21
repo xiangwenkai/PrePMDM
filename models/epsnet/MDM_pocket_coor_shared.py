@@ -87,8 +87,8 @@ class MDM_full_pocket_coor_shared(nn.Module):
         self.edge_encoder_global = get_edge_encoder(config)
         self.edge_encoder_local = get_edge_encoder(config)
         # self.hidden_dim = config.hidden_dim
-        self.atom_type_input_dim = config.num_atom if 'num_atom' in config else 8  # contains simple tmb or charge or not qm9:5+1(charge) geom: 16+1(charge)
-        self.atom_out_dim = config.num_atom if 'num_atom' in config else 8  # contains charge or not
+        self.atom_type_input_dim = config.atom_type if 'atom_type' in config else 8  # contains simple tmb or charge or not qm9:5+1(charge) geom: 16+1(charge)
+        self.atom_out_dim = config.atom_type if 'atom_type' in config else 8  # contains charge or not
         self.time_emb = config.time_emb if 'time_emb' in config else True
         self.atom_num_emb = config.atom_num_emb if 'atom_num_emb' in config else False
         self.vae_context = config.vae_context if 'vae_context' in config else False
