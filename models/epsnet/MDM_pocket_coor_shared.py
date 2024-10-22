@@ -1,4 +1,8 @@
 import math
+from rdkit import Chem
+from rdkit.Chem import AllChem
+from openbabel import pybel
+from utils.reconstruct import *
 
 import numpy as np
 import torch
@@ -7,6 +11,7 @@ from torch import nn
 from torch_scatter import scatter_mean
 from tqdm.auto import tqdm
 
+from utils.misc import *
 from utils.chem import BOND_TYPES
 from .diffusion import get_num_embedding
 from ..common import (MultiLayerPerceptron, extend_graph_order_radius, get_edges)
@@ -15,6 +20,10 @@ from ..encoders import (EGNN_Sparse_Network, SchNetEncoder,
                         get_edge_encoder)
 from ..encoders.attention import BasicTransformerBlock
 from ..geometry import eq_transform, get_distance
+
+
+atomic_numbers_crossdock = torch.LongTensor([1, 6, 7, 8, 9, 15, 16, 17])
+ATOM_FAMILIES = ['Acceptor', 'Donor', 'Aromatic', 'Hydrophobe', 'LumpedHydrophobe', 'NegIonizable', 'PosIonizable', 'ZnBinder']
 
 
 def get_beta_schedule(beta_schedule, beta_start, beta_end, num_diffusion_timesteps):
@@ -72,6 +81,42 @@ def betas_for_alpha_bar(num_diffusion_timesteps, alpha_bar, max_beta=0.999):
         t2 = (i + 1) / num_diffusion_timesteps
         betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
+
+
+def compute_alpha(beta, t):
+    beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
+    a = (1 - beta).cumprod(dim=0).index_select(0, t + 1)  # .view(-1, 1, 1, 1)
+    return a
+
+
+def calculate_energy_from_coordinates(rd_molecule):
+    # # 创建xyz文件内容
+    # xyz_content = f"{len(atom_types)}\n\n"  # xyz格式需要第一行是原子数，第二行是空行或注释
+    # for atom_type, (x, y, z) in zip(atom_types, coordinates):
+    #     xyz_content += f"{atom_type} {x:.4f} {y:.4f} {z:.4f}\n"
+    #
+    # # 使用pybel读取xyz格式
+    # ob_molecule = pybel.readstring("xyz", xyz_content)
+    #
+    # # 如果想保留三维坐标，使用 MolBlock 格式进行转换
+    # mol_block = ob_molecule.write("mol")
+    # rd_molecule = Chem.MolFromMolBlock(mol_block)
+    #
+    # # print(Chem.MolToSmiles(rd_molecule))
+    # # print(rd_molecule.GetConformer().GetPositions())
+
+    # Chem.SanitizeMol(rd_molecule)
+    props = AllChem.MMFFGetMoleculeProperties(rd_molecule, mmffVariant='MMFF94')
+    if props is None:
+        raise ValueError("Unable to generate MMFF properties for this molecule.")
+
+    forcefield = AllChem.MMFFGetMoleculeForceField(rd_molecule, props)
+    if forcefield is None:
+        raise ValueError("Unable to create force field for this molecule.")
+
+    # energy = forcefield.CalcEnergy()
+    grad = forcefield.CalcGrad()
+    return grad
 
 
 class MDM_full_pocket_coor_shared(nn.Module):
@@ -654,8 +699,7 @@ class MDM_full_pocket_coor_shared(nn.Module):
         )  # (E_global, 1), (E_local, 1)
 
         if self.vae_context:
-            pos_eq_global, pos_eq_local, node_score_global, node_score_local, edge_index, edge_type, edge_length, local_edge_mask = net_out[
-                                                                                                                                    :-1]
+            pos_eq_global, pos_eq_local, node_score_global, node_score_local, edge_index, edge_type, edge_length, local_edge_mask = net_out[:-1]
         else:
             pos_eq_global, pos_eq_local, node_score_global, node_score_local, edge_index, edge_type, edge_length, local_edge_mask = net_out
         edge2graph = node2graph.index_select(0, edge_index[0])
@@ -704,6 +748,87 @@ class MDM_full_pocket_coor_shared(nn.Module):
         else:
             loss = loss_pos + loss_node
         # loss_pos = scatter_add(loss_pos.squeeze(), node2graph)  # (G, 1)
+
+        # +++++++++++++++++ mmff loss +++++++++++++++++ #
+        ligand_pos_unbatch = unbatch(ligand_pos, batch.ligand_element_batch)
+        ligand_atom_type_unbatch = unbatch(ligand_atom_type, batch.ligand_element_batch)
+        pos_eq_local_unbatch = unbatch(pos_eq_local, batch.ligand_element_batch)
+        pos_eq_global_unbatch = unbatch(pos_eq_global, batch.ligand_element_batch)
+        node_score_local_unbatch = unbatch(node_score_local, batch.ligand_element_batch)
+        node_score_global_unbatch = unbatch(node_score_global, batch.ligand_element_batch)
+
+        clip = 1000
+        node_eq_local_unbatch = pos_eq_local_unbatch
+        w_global_pos = 0.2
+        w_global_node = 0.2
+        w_local_pos = 0.2
+        w_local_node = 0.2
+        step_lr = 0.000001
+
+        eta = 1.
+        loss_mmff = 0.
+        for i, t in enumerate(time_step):
+            if t < 50:
+                sigma = (1.0 - self.alphas[t]).sqrt() / self.alphas[t].sqrt()
+                # Global
+                node_eq_global_i = pos_eq_global_unbatch[i]
+                node_eq_global_i = clip_norm(node_eq_global_i, limit=clip)
+
+                # Sum
+                eps_pos_i = w_local_pos * node_eq_local_unbatch[i] + w_global_pos * node_eq_global_i  # + eps_pos_reg * w_reg
+                eps_node_i = w_local_node * node_score_local_unbatch[i] + w_global_node * node_score_global_unbatch[i]
+                # eps_pos = 3 * node_eq_local + 1 * node_eq_global  # + eps_pos_reg * w_reg
+                # eps_node = 1 * node_score_local + 1 * node_score_global
+                # Update
+
+                noise = torch.randn_like(ligand_pos_unbatch[i])
+                noise_node = torch.randn_like(ligand_atom_type_unbatch[i])  # center_pos(torch.randn_like(pos), batch)
+                b = self.betas
+                next_t = (torch.ones(1) * (t - 1)).to(ligand_pos.device)
+                at = compute_alpha(b, torch.tensor(t, dtype=torch.long).to(b.device))
+                at_next = compute_alpha(b, next_t.long())
+
+                # generalized
+                et = -eps_pos_i
+
+                c1 = eta * ((1 - at / at_next) * (1 - at_next) / (1 - at)).sqrt()
+                c2 = ((1 - at_next) - c1 ** 2).sqrt()
+
+                step_size_pos_ld = step_lr * (sigma / 0.01) ** 2 / sigma
+                step_size_pos_generalized = 3 * ((1 - at).sqrt() / at.sqrt() - c2 / at_next.sqrt())
+                step_size_pos = step_size_pos_ld if step_size_pos_ld < step_size_pos_generalized else step_size_pos_generalized
+
+                step_size_noise_ld = torch.sqrt((step_lr * (sigma / 0.01) ** 2) * 2)
+                step_size_noise_generalized = 5 * (c1 / at_next.sqrt())
+                step_size_noise = step_size_noise_ld if step_size_noise_ld < step_size_noise_generalized else step_size_noise_generalized
+
+                # w = 1+2 * i/self.num_timesteps
+                w = 1
+
+                eps_node_i = eps_node_i / (1 - at).sqrt()
+                pos_next = ligand_pos_unbatch[i] - et * step_size_pos + w * noise * step_size_noise
+                atom_next = ligand_atom_type_unbatch[i] - eps_node_i * step_size_pos + w * noise_node * step_size_noise
+
+                ligand_pos_i = pos_next
+                ligand_atom_type_i = atom_next
+
+                new_element = torch.tensor([atomic_numbers_crossdock[m] for m in torch.argmax(ligand_atom_type_i[:, :8], dim=1)])
+                indicators_elements = torch.argmax(ligand_atom_type_i[:, 8:], dim=1)
+                indicators = torch.zeros([ligand_pos_i.size(0), len(ATOM_FAMILIES)], dtype=torch.long)
+                for i, n in enumerate(indicators_elements):
+                    indicators[i, n] = 1
+
+                try:
+                    gmol = reconstruct_from_generated(ligand_pos_i, new_element, indicators)
+                    grad = calculate_energy_from_coordinates(gmol)
+                    grad = torch.clamp(torch.tensor(grad)*0.01, -2, 2).to(ligand_pos_i.device)
+                    mmff_ligand_coor = ligand_pos_i - grad.reshape(ligand_pos_i.shape) / 2
+                    loss_mmff += ((ligand_pos_i - mmff_ligand_coor) ** 2).sum()
+                    loss += loss_mmff
+                except:
+                    pass
+
+        # +++++++++++++++++ mmff loss +++++++++++++++++ #
 
         if return_unreduced_edge_loss:
             pass
