@@ -768,6 +768,7 @@ class MDM_full_pocket_coor_shared(nn.Module):
         eta = 1.
         loss_mmff = 0.
         for i, t in enumerate(time_step):
+            indices = torch.nonzero(batch.ligand_element_batch == i).squeeze()
             if t < 50:
                 sigma = (1.0 - self.alphas[t]).sqrt() / self.alphas[t].sqrt()
                 # Global
@@ -784,7 +785,7 @@ class MDM_full_pocket_coor_shared(nn.Module):
                 noise = torch.randn_like(ligand_pos_unbatch[i])
                 noise_node = torch.randn_like(ligand_atom_type_unbatch[i])  # center_pos(torch.randn_like(pos), batch)
                 b = self.betas
-                next_t = (torch.ones(1) * (t - 1)).to(ligand_pos.device)
+                next_t = (torch.ones(1) * (t.item() - 1)).to(ligand_pos.device)
                 at = compute_alpha(b, torch.tensor(t, dtype=torch.long).to(b.device))
                 at_next = compute_alpha(b, next_t.long())
 
@@ -823,8 +824,8 @@ class MDM_full_pocket_coor_shared(nn.Module):
                     grad = calculate_energy_from_coordinates(gmol)
                     grad = torch.clamp(torch.tensor(grad)*0.01, -2, 2).to(ligand_pos_i.device)
                     mmff_ligand_coor = ligand_pos_i - grad.reshape(ligand_pos_i.shape) / 2
-                    loss_mmff += ((ligand_pos_i - mmff_ligand_coor) ** 2).sum()
-                    loss += loss_mmff
+                    loss_mmff += ((ligand_pos_i - mmff_ligand_coor) ** 2).sum(dim=1)
+                    loss[indices] += loss_mmff.unsqueeze(dim=-1)
                 except:
                     pass
 
