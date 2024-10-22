@@ -1,9 +1,11 @@
 import math
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from openbabel import pybel
 from utils.reconstruct import *
 from rdkit import RDLogger
 RDLogger.DisableLog('rdApp.*')
+pybel.ob.obErrorLog.StopLogging()
 
 import numpy as np
 import torch
